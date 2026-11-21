@@ -1,0 +1,9 @@
+{
+  "protected_bundle_ids": [
+    "com.apple.finder",
+    "com.apple.Terminal",
+    "com.googlecode.iterm2",
+    "com.vayu.agent",
+    "com.apple.systempreferences"
+  ]
+}
