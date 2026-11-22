@@ -21,13 +21,16 @@ class AudioConfig(BaseModel):
     channels: int = Field(default=1, ge=1, le=1)
     frame_samples: int = Field(default=1280, ge=320, le=4096)  # 80ms @ 16kHz
     ring_buffer_seconds: float = Field(default=2.0, gt=0.5, le=10.0)
-    wake_threshold: float = Field(default=0.55, gt=0.0, lt=1.0)
-    cooldown_seconds: float = Field(default=3.0, ge=1.0, le=60.0)
+    wake_threshold: float = Field(default=0.20, gt=0.0, lt=1.0)
+    wake_target_rms: float = Field(default=0.08, gt=0.01, le=0.5)
+    wake_max_gain: float = Field(default=10.0, ge=1.0, le=20.0)
+    wake_rms_gate: float = Field(default=0.0025, ge=0.0, lt=0.1)
+    cooldown_seconds: float = Field(default=2.5, ge=0.5, le=60.0)
     silence_rms_threshold: float = Field(default=0.0045, gt=0.0, lt=1.0)
-    min_capture_sec: float = Field(default=1.6, ge=0.4, le=5.0)
-    speech_onset_timeout_sec: float = Field(default=2.5, ge=1.0, le=10.0)
-    silence_duration_sec: float = Field(default=0.85, ge=0.2, le=3.0)
-    max_command_sec: float = Field(default=4.5, ge=2.0, le=20.0)
+    min_capture_sec: float = Field(default=1.8, ge=0.5, le=5.0)
+    speech_onset_timeout_sec: float = Field(default=3.0, ge=1.0, le=10.0)
+    silence_duration_sec: float = Field(default=0.9, ge=0.2, le=3.0)
+    max_command_sec: float = Field(default=7.0, ge=2.0, le=20.0)
     whisper_repo: str = Field(default="mlx-community/whisper-small.en-mlx", min_length=3)
     initial_prompt: str = Field(
         default=(
@@ -104,39 +107,18 @@ class AudioEngine:
         self._last_trigger_ts: float = 0.0
 
         self._oww_model = None
-        self._whisper_warmed: bool = False
 
     def _init_wakeword_model(self) -> None:
         verify_model_manifest(self.manifest_path)
         from openwakeword.model import Model  # Lazy import so unit tests run headless
 
-        if self.wakeword_model_paths:
-            self._oww_model = Model(
-                wakeword_models=self.wakeword_model_paths,
-                inference_framework="onnx",
-            )
-        else:
-            self._oww_model = Model(inference_framework="onnx")
-
-    def _warmup_whisper_background(self) -> None:
-        """Serializes Whisper Metal warmup so live transcription never collides with it."""
-        with self._whisper_lock:
-            if self._whisper_warmed:
-                return
-            try:
-                print("[Vayu] Loading speech model into unified memory...", flush=True)
-                import mlx_whisper
-
-                mlx_whisper.transcribe(
-                    np.zeros(int(self.config.sample_rate * 0.5), dtype=np.float32),
-                    path_or_hf_repo=self.config.whisper_repo,
-                    fp16=True,
-                    condition_on_previous_text=False,
-                )
-                self._whisper_warmed = True
-                print("[Vayu] Speech engine ready — say 'Hey Jarvis' now.", flush=True)
-            except Exception as exc:
-                print(f"[Vayu] Whisper warmup error: {exc}", flush=True)
+        target_models = (
+            self.wakeword_model_paths if self.wakeword_model_paths else ["hey_jarvis"]
+        )
+        self._oww_model = Model(
+            wakeword_models=target_models,
+            inference_framework="onnx",
+        )
 
     def enable_mic(self) -> None:
         """Opens the hardware input stream (auto-resetting CoreAudio on -9986) and starts the RAM loop."""
@@ -167,12 +149,6 @@ class AudioEngine:
                     sd._initialize()
 
             self._mic_enabled.set()
-
-            threading.Thread(
-                target=self._warmup_whisper_background,
-                name="vayu-whisper-warmup",
-                daemon=True,
-            ).start()
 
             self._worker_thread = threading.Thread(
                 target=self._listen_loop, name="vayu-audio-loop", daemon=True
@@ -210,21 +186,32 @@ class AudioEngine:
         self._last_trigger_ts = current
         return True
 
+    def _boost_for_wakeword(self, mono: np.ndarray) -> np.ndarray:
+        """Applies adaptive RMS normalization so quiet speech enters openWakeWord's optimal range."""
+        if mono.size == 0 or self.config.wake_max_gain <= 1.0:
+            return mono
+        f32 = mono.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(f32 ** 2)))
+        if rms < self.config.wake_rms_gate:
+            return mono
+        gain = min(self.config.wake_max_gain, self.config.wake_target_rms / rms)
+        boosted = np.clip(f32 * gain, -0.95, 0.95)
+        return (boosted * 32767.0).astype(np.int16)
+
     def transcribe_pcm_in_memory(self, pcm_int16: np.ndarray) -> str:
         """Transcribes 16kHz mono int16 numpy audio strictly in RAM via mlx-whisper."""
         if pcm_int16.size == 0:
             return ""
         audio_f32 = pcm_int16.astype(np.float32) / 32768.0
 
-        # Auto-gain normalize quiet MacBook Air mic speech up to 0.65 peak
+        # Boost quiet MacBook Air speech while keeping ambient noise floor untouched
         peak = float(np.max(np.abs(audio_f32)))
-        if 0.0025 < peak < 0.45:
-            gain = min(35.0, 0.65 / peak)
-            audio_f32 = np.clip(audio_f32 * gain, -1.0, 1.0)
+        if 0.005 < peak < 0.35:
+            audio_f32 = np.clip(audio_f32 * (0.6 / peak), -1.0, 1.0)
+
+        import mlx_whisper
 
         with self._whisper_lock:
-            import mlx_whisper
-
             result = mlx_whisper.transcribe(
                 audio_f32,
                 path_or_hf_repo=self.config.whisper_repo,
@@ -232,8 +219,6 @@ class AudioEngine:
                 initial_prompt=self.config.initial_prompt,
                 condition_on_previous_text=False,
             )
-            self._whisper_warmed = True
-
         raw_text = str(result.get("text", "")).strip()
         return raw_text.rstrip(".!?,;:")
 
@@ -241,12 +226,16 @@ class AudioEngine:
         self, preroll_frames: list[np.ndarray] | None = None
     ) -> np.ndarray:
         """
-        Captures post-wake speech with pre-roll and a guaranteed minimum window,
-        always returning the captured PCM buffer so soft speech is never dropped.
+        Captures post-wake speech with pre-roll, a guaranteed minimum listening window,
+        and adaptive RMS endpointing so soft speech is never dropped.
         """
         frames: list[np.ndarray] = list(preroll_frames) if preroll_frames else []
         min_frames = int(
             (self.config.min_capture_sec * self.config.sample_rate)
+            // self.config.frame_samples
+        )
+        onset_max_frames = int(
+            (self.config.speech_onset_timeout_sec * self.config.sample_rate)
             // self.config.frame_samples
         )
         silence_frames_needed = int(
@@ -276,13 +265,14 @@ class AudioEngine:
             else:
                 consecutive_silent += 1
 
+            # Always record at least min_capture_sec after wake word
             if idx < min_frames:
                 continue
 
-            if speech_started and consecutive_silent >= silence_frames_needed:
+            if not speech_started and idx >= onset_max_frames:
                 break
 
-            if not speech_started and idx >= min_frames + 6:
+            if speech_started and consecutive_silent >= silence_frames_needed:
                 break
 
         if not frames:
@@ -305,40 +295,45 @@ class AudioEngine:
             if self._oww_model is None:
                 continue
 
-            predictions: dict[str, float] = self._oww_model.predict(mono)
-            for wake_label, score in predictions.items():
+            wake_frame = self._boost_for_wakeword(mono)
+            predictions: dict[str, float] = self._oww_model.predict(wake_frame)
+
+            for wake_label, raw_score in predictions.items():
+                score = float(raw_score)
                 if not self.wakeword_model_paths and "jarvis" not in wake_label.lower():
                     continue
 
-                if self.should_accept_wake(float(score)):
-                    try:
-                        print(
-                            f"[Vayu Wake] Triggered ({wake_label}, score={score:.2f}) — speak command now...",
-                            flush=True,
-                        )
-                        if self.on_wake_confirm and not self.on_wake_confirm(
-                            wake_label, float(score)
-                        ):
-                            break
+                if 0.10 <= score < self.config.wake_threshold:
+                    print(
+                        f"[Vayu Wake Miss] {wake_label} score={score:.2f} "
+                        f"(threshold={self.config.wake_threshold:.2f})"
+                    )
 
-                        preroll = list(self._ring_buffer)[-3:]
-                        self._ring_buffer.clear()
+                if self.should_accept_wake(score):
+                    print(
+                        f"[Vayu Wake] Triggered ({wake_label}, score={score:.2f}) — speak command now..."
+                    )
+                    if self.on_wake_confirm and not self.on_wake_confirm(
+                        wake_label, score
+                    ):
+                        break
 
-                        command_pcm = self._capture_command_until_silence(
-                            preroll_frames=preroll
-                        )
-                        print("[Vayu Transcribing...]", flush=True)
+                    preroll = list(self._ring_buffer)[-3:]
+                    self._ring_buffer.clear()
 
-                        transcript = self.transcribe_pcm_in_memory(command_pcm)
-                        del command_pcm
+                    command_pcm = self._capture_command_until_silence(
+                        preroll_frames=preroll
+                    )
 
-                        if hasattr(self._oww_model, "reset"):
-                            self._oww_model.reset()
-                        self._last_trigger_ts = time.monotonic()
+                    print("[Vayu Transcribing...]")
+                    transcript = self.transcribe_pcm_in_memory(command_pcm)
+                    del command_pcm
 
-                        print(f"[Vayu Heard] {transcript!r}", flush=True)
-                        if self.on_transcript:
-                            self.on_transcript(transcript)
-                    except Exception as exc:
-                        print(f"[Vayu Error] {exc}", flush=True)
+                    if hasattr(self._oww_model, "reset"):
+                        self._oww_model.reset()
+                    self._last_trigger_ts = time.monotonic()
+
+                    print(f"[Vayu Heard] {transcript!r}")
+                    if self.on_transcript:
+                        self.on_transcript(transcript)
                     break

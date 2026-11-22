@@ -5,68 +5,127 @@
   },
   "apps": {
     "vscode": {
-      "spoken_names": ["vs code", "visual studio code", "code"],
+      "spoken_names": [
+        "vs code",
+        "visual studio code",
+        "code"
+      ],
       "bundle_id": "com.microsoft.VSCode",
       "path": "/Applications/Visual Studio Code.app"
     },
     "chrome": {
-      "spoken_names": ["chrome", "google chrome", "browser"],
+      "spoken_names": [
+        "chrome",
+        "google chrome",
+        "browser"
+      ],
       "bundle_id": "com.google.Chrome",
       "path": "/Applications/Google Chrome.app"
     },
     "safari": {
-      "spoken_names": ["safari"],
+      "spoken_names": [
+        "safari"
+      ],
       "bundle_id": "com.apple.Safari",
       "path": "/Applications/Safari.app"
     },
     "notion": {
-      "spoken_names": ["notion"],
+      "spoken_names": [
+        "notion"
+      ],
       "bundle_id": "notion.id",
       "path": "/Applications/Notion.app"
     },
-    "spotify": {
-      "spoken_names": ["spotify", "music"],
-      "bundle_id": "com.spotify.client",
-      "path": "/Applications/Spotify.app"
+    "canva": {
+      "spoken_names": [
+        "canva"
+      ],
+      "bundle_id": "com.canva.canvaeditor",
+      "path": "/Applications/Canva.app"
+    },
+    "claude": {
+      "spoken_names": [
+        "claude",
+        "claude ai"
+      ],
+      "bundle_id": "com.anthropic.claudefordesktop",
+      "path": "/Applications/Claude.app"
     }
   },
   "folders": {
     "downloads": {
-      "spoken_names": ["downloads", "downloads folder"],
+      "spoken_names": [
+        "downloads",
+        "downloads folder"
+      ],
       "path": "~/Downloads"
     },
     "documents": {
-      "spoken_names": ["documents", "documents folder"],
+      "spoken_names": [
+        "documents",
+        "documents folder"
+      ],
       "path": "~/Documents"
     },
     "projects": {
-      "spoken_names": ["projects", "developer", "code folder"],
+      "spoken_names": [
+        "projects",
+        "developer",
+        "code folder"
+      ],
       "path": "~/Developer"
+    },
+    "desktop": {
+      "spoken_names": [
+        "desktop"
+      ],
+      "path": "~/Desktop"
     }
   },
   "bookmarks": {
     "youtube": {
-      "spoken_names": ["youtube"],
+      "spoken_names": [
+        "youtube"
+      ],
       "url": "https://www.youtube.com"
     },
     "github": {
-      "spoken_names": ["github"],
+      "spoken_names": [
+        "github"
+      ],
       "url": "https://github.com"
     },
     "gmail": {
-      "spoken_names": ["gmail", "mail"],
+      "spoken_names": [
+        "gmail",
+        "mail"
+      ],
       "url": "https://mail.google.com"
+    },
+    "spotify": {
+      "spoken_names": [
+        "spotify",
+        "music"
+      ],
+      "url": "https://open.spotify.com"
     }
   },
   "modes": {
     "study_mode": {
-      "spoken_names": ["study mode", "study"],
+      "spoken_names": [
+        "study mode",
+        "study"
+      ],
       "layout": "50_50",
       "left": "youtube",
       "right": "notion"
     },
     "code_mode": {
-      "spoken_names": ["code mode", "coding mode", "dev mode"],
+      "spoken_names": [
+        "code mode",
+        "coding mode",
+        "dev mode"
+      ],
       "layout": "70_30",
       "left": "vscode",
       "right": "github"

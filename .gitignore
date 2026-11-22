@@ -2,11 +2,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-.DS_Store
-.env
 config/aliases.json
 *.log
 models/
 *.onnx
 *.safetensors
 *.bin
+.DS_Store

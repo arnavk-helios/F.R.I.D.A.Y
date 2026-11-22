@@ -5,130 +5,164 @@ from dataclasses import dataclass
 from typing import Any
 
 
-class PIIDetectedError(PermissionError):
-    """Raised when un-aliased PII, paths, or numbers are detected before LLM routing."""
-
-    def __init__(self, category: str) -> None:
-        self.category = category
-        super().__init__(
-            f"Blocked before LLM ({category} detected). "
-            "Please rephrase using a saved alias in config/aliases.json."
-        )
+class PIIDetectedError(ValueError):
+    """Raised when un-aliased PII, paths, emails, or numeric identifiers are detected."""
 
 
 @dataclass(frozen=True)
-class SanitizedPrompt:
+class SanitizationResult:
     sanitized_text: str
     referenced_aliases: list[str]
 
 
 class PrivacySanitizer:
     """
-    Replaces allowlisted spoken aliases with bracketed tokens (e.g., [canva])
-    and blocks raw file paths, emails, digits/phone numbers, and personal names
-    from leaving the device.
+    Tier 2 Pre-Cloud & Pre-LLM Privacy Gate:
+      - Normalizes layout ratios (50-50, 5050, 70/30, top bottom) into [layout:...] tokens first.
+      - Replaces allowlisted apps, folders, and bookmarks with bracketed [alias] tokens.
+      - Blocks raw filesystem paths, emails, numeric identifiers, and un-aliased names.
     """
 
-    PATH_RE = re.compile(r"(?:~|\.{1,2})?/[^\s]+|[a-zA-Z]:\\[^\s]+")
-    EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-    DIGIT_RE = re.compile(r"\d+")
-    DIRECT_PERSON_RE = re.compile(
-        r"\b(?:call|text|email|message|dm|ping|tell|ask)\s+([a-z]{2,})\b"
+    WAKE_PREFIX_RE = re.compile(
+        r"^(?:hey\s+jarvis|jarvis|hey\s+vayu|vayu)[,\s]*", re.IGNORECASE
     )
+    PATH_RE = re.compile(
+        r"(?:~\/|\/(?:Users|Applications|System|Library|Volumes|tmp|var|etc)\/|[A-Za-z]:\\)",
+        re.IGNORECASE,
+    )
+    EMAIL_RE = re.compile(r"\b[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+\b")
+    URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+    NUMBER_RE = re.compile(r"\d+")
+    CAPITALIZED_WORD_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
 
-    SAFE_PRONOUNS_AND_WORDS = {
-        "it", "them", "him", "her", "me", "my", "the", "a", "an",
-        "on", "up", "in", "out", "off", "back", "now", "please",
+    LAYOUT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+        (re.compile(r"\b50[\s/-]?50\b", re.IGNORECASE), "[layout:50_50]"),
+        (re.compile(r"\b70[\s/-]?30\b", re.IGNORECASE), "[layout:70_30]"),
+        (re.compile(r"\b30[\s/-]?70\b", re.IGNORECASE), "[layout:30_70]"),
+        (re.compile(r"\btop[\s_-]?bottom\b", re.IGNORECASE), "[layout:top_bottom]"),
+    ]
+
+    NON_NAME_CAPITALIZED = {
+        "open",
+        "close",
+        "quit",
+        "exit",
+        "split",
+        "tile",
+        "put",
+        "launch",
+        "start",
+        "arrange",
+        "switch",
+        "mode",
+        "screen",
+        "side",
+        "and",
+        "also",
+        "then",
+        "with",
+        "the",
+        "for",
+        "to",
+        "my",
+        "folder",
+        "app",
+        "website",
+        "youtube",
+        "canva",
+        "notion",
+        "chrome",
+        "safari",
+        "spotify",
+        "claude",
+        "github",
+        "gmail",
+        "code",
+        "desktop",
+        "downloads",
+        "documents",
+        "projects",
     }
-
-    LAYOUT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-        (re.compile(r"\b70[\s/]30\b"), "[layout:70_30]"),
-        (re.compile(r"\b30[\s/]70\b"), "[layout:30_70]"),
-        (re.compile(r"\b50[\s/]50\b"), "[layout:50_50]"),
-        (re.compile(r"\btop[\s_-]bottom\b"), "[layout:top_bottom]"),
-    )
 
     def __init__(self, aliases_config: dict[str, Any]) -> None:
         self.config = aliases_config
-        self._phrase_to_alias, self._alias_regex = self._compile_alias_matcher()
-        self._known_alias_tokens = self._collect_known_words()
+        self._alias_entries = self._build_alias_entries()
 
-    def _compile_alias_matcher(self) -> tuple[dict[str, str], re.Pattern[str] | None]:
-        pairs: dict[str, str] = {}
+    def _build_alias_entries(self) -> list[tuple[str, str]]:
+        """Returns (spoken_phrase, alias_key) sorted longest-first for greedy matching."""
+        pairs: list[tuple[str, str]] = []
         for section in ("apps", "folders", "bookmarks", "modes"):
-            for alias_key, entry in self.config.get(section, {}).items():
-                pairs[alias_key.lower().replace("_", " ")] = alias_key
-                pairs[alias_key.lower()] = alias_key
+            for alias, entry in self.config.get(section, {}).items():
+                pairs.append((alias.replace("_", " ").lower(), alias))
                 for spoken in entry.get("spoken_names", []):
                     cleaned = spoken.strip().lower()
                     if cleaned:
-                        pairs[cleaned] = alias_key
+                        pairs.append((cleaned, alias))
+        pairs.sort(key=lambda item: len(item[0]), reverse=True)
+        return pairs
 
-        if not pairs:
-            return {}, None
+    def sanitize(self, raw_transcript: str) -> SanitizationResult:
+        text = self.WAKE_PREFIX_RE.sub("", raw_transcript.strip()).strip()
+        if not text:
+            raise PIIDetectedError("Blocked before LLM (empty command).")
 
-        # Single-pass alternation sorted longest-first prevents double-bracketing [[alias]]
-        sorted_phrases = sorted(pairs.keys(), key=len, reverse=True)
-        alternation = "|".join(re.escape(phrase) for phrase in sorted_phrases)
-        pattern = re.compile(rf"(?<!\[)\b(?:{alternation})\b(?!\])", flags=re.IGNORECASE)
-        return pairs, pattern
+        # 1. Block raw filesystem paths before any alias replacement
+        if self.PATH_RE.search(text):
+            raise PIIDetectedError(
+                "Blocked before LLM (filesystem path detected). Please rephrase using a saved alias in config/aliases.json."
+            )
 
-    def _collect_known_words(self) -> set[str]:
-        words = {"vayu", "hey", "mac", "os", "ai", "ui", "pdf", "url"}
-        for section in ("apps", "folders", "bookmarks", "modes"):
-            for alias_key, entry in self.config.get(section, {}).items():
-                words.update(alias_key.lower().split("_"))
-                for spoken in entry.get("spoken_names", []):
-                    words.update(spoken.lower().split())
-        return words
+        # 2. Block email addresses
+        if self.EMAIL_RE.search(text):
+            raise PIIDetectedError(
+                "Blocked before LLM (email address detected). Please rephrase using a saved alias in config/aliases.json."
+            )
 
-    def sanitize(self, raw_transcript: str) -> SanitizedPrompt:
-        cleaned = raw_transcript.strip()
-        cleaned = re.sub(r"^(?:hey\s+vayu|vayu)[,\s]*", "", cleaned, flags=re.IGNORECASE).strip()
-        if not cleaned:
-            raise PIIDetectedError("empty command")
+        # 3. Convert split-screen layout ratios into safe [layout:...] tokens BEFORE numeric checks
+        working = text
+        for pattern, token in self.LAYOUT_PATTERNS:
+            working = pattern.sub(token, working)
 
-        # 1. Check for raw filesystem paths and emails before token replacement
-        if self.PATH_RE.search(cleaned):
-            raise PIIDetectedError("file path")
-        if self.EMAIL_RE.search(cleaned):
-            raise PIIDetectedError("email address")
-
-        # 2. Detect capitalized personal names not matching known app/bookmark titles
-        words_raw = re.findall(r"\b[A-Za-z]+\b", cleaned)
-        for idx, word in enumerate(words_raw):
-            if idx == 0:
-                continue  # Ignore sentence-initial capitalization
-            if word[0].isupper() and word.lower() not in self._known_alias_tokens:
-                raise PIIDetectedError("personal name")
-
-        # 3. Single-pass replacement of allowlisted aliases and layout ratios
-        tokenized = cleaned.lower()
+        # 4. Replace allowlisted aliases with [alias] tokens (skipping existing [...] tokens)
         referenced: list[str] = []
+        for spoken, alias in self._alias_entries:
+            word_re = re.compile(rf"(?<!\[)\b{re.escape(spoken)}\b(?!\])", re.IGNORECASE)
+            if word_re.search(working):
+                working = word_re.sub(f"[{alias}]", working)
+                if alias not in referenced:
+                    referenced.append(alias)
 
-        if self._alias_regex is not None:
-            def _replace_alias(match: re.Match[str]) -> str:
-                alias_key = self._phrase_to_alias[match.group(0).lower()]
-                if alias_key not in referenced:
-                    referenced.append(alias_key)
-                return f"[{alias_key}]"
+        # Strip bracketed tokens temporarily to inspect residual un-aliased text
+        residual = re.sub(r"\[[^\]]+\]", " ", working)
 
-            tokenized = self._alias_regex.sub(_replace_alias, tokenized)
+        # 5. Block raw URLs not matched to a saved bookmark alias
+        if self.URL_RE.search(residual):
+            raise PIIDetectedError(
+                "Blocked before LLM (un-aliased URL detected). Please rephrase using a saved alias in config/aliases.json."
+            )
 
-        for layout_re, layout_token in self.LAYOUT_PATTERNS:
-            tokenized = layout_re.sub(layout_token, tokenized)
+        # 6. Block any remaining numeric identifiers (phone numbers, IDs, street numbers)
+        if self.NUMBER_RE.search(residual):
+            raise PIIDetectedError(
+                "Blocked before LLM (numeric identifier detected). Please rephrase using a saved alias in config/aliases.json."
+            )
 
-        # 4. Inspect residual un-aliased text for digits or person-targeted verbs
-        residual = re.sub(r"\[[^\]]+\]", " ", tokenized)
-        if self.DIGIT_RE.search(residual):
-            raise PIIDetectedError("numeric identifier")
+        # 7. Block capitalized personal names outside [alias] tokens
+        words = residual.split()
+        for idx, raw_word in enumerate(words):
+            cleaned_word = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", raw_word)
+            if not cleaned_word:
+                continue
+            if idx == 0:
+                continue
+            if self.CAPITALIZED_WORD_RE.match(cleaned_word):
+                if cleaned_word.lower() not in self.NON_NAME_CAPITALIZED:
+                    raise PIIDetectedError(
+                        "Blocked before LLM (personal name detected). Please rephrase using a saved alias in config/aliases.json."
+                    )
 
-        person_match = self.DIRECT_PERSON_RE.search(residual)
-        if person_match and person_match.group(1) not in self.SAFE_PRONOUNS_AND_WORDS:
-            raise PIIDetectedError("personal name")
-
-        normalized_out = re.sub(r"\s+", " ", tokenized).strip()
-        return SanitizedPrompt(
+        normalized_out = re.sub(r"\s+", " ", working).strip()
+        return SanitizationResult(
             sanitized_text=normalized_out,
             referenced_aliases=referenced,
         )
