@@ -24,7 +24,7 @@ class PrivacySanitizer:
     """
 
     WAKE_PREFIX_RE = re.compile(
-        r"^(?:hey\s+jarvis|jarvis|hey\s+vayu|vayu)[,\s]*", re.IGNORECASE
+        r"^(?:hey\s+jarvis|jarvis|hey\s+vayu|vayu|hey\s+friday|friday)[,\s]*", re.IGNORECASE
     )
     PATH_RE = re.compile(
         r"(?:~\/|\/(?:Users|Applications|System|Library|Volumes|tmp|var|etc)\/|[A-Za-z]:\\)",

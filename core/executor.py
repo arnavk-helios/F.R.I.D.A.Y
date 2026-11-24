@@ -1,35 +1,25 @@
-import datetime
-import difflib
+from __future__ import annotations
+
 import ipaddress
 import json
 import os
+import shutil
 import stat
 import subprocess
+from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Literal
-from urllib.parse import quote_plus, urlparse
+from typing import Any, Literal
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-LayoutType = Literal["50_50", "70_30", "30_70", "top_bottom"]
-SystemActionType = Literal[
-    "volume_up",
-    "volume_down",
-    "set_volume",
-    "mute",
-    "unmute",
-    "dark_mode_toggle",
-    "screenshot",
-    "minimize_all",
-]
 
-
-class SecurityViolationError(PermissionError):
-    """Raised when a command violates Vayu's execution or privacy boundaries."""
+class SecurityViolationError(Exception):
+    """Raised when a command violates permissions, allowlists, schemas, or URL policies."""
 
 
 class ConfirmationRequiredError(Exception):
-    """Raised when an action is valid but requires explicit HUD/voice confirmation."""
+    """Raised when a high-impact action requires explicit user confirmation via the HUD."""
 
     def __init__(self, prompt: str, action_payload: dict[str, Any]) -> None:
         super().__init__(prompt)
@@ -37,612 +27,673 @@ class ConfirmationRequiredError(Exception):
         self.action_payload = action_payload
 
 
-class OpenTargetArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    target_alias: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
+class SystemActionType(str, Enum):
+    VOLUME_UP = "volume_up"
+    VOLUME_DOWN = "volume_down"
+    SET_VOLUME = "set_volume"
+    MUTE = "mute"
+    UNMUTE = "unmute"
+    DARK_MODE_TOGGLE = "dark_mode_toggle"
+    SCREENSHOT = "screenshot"
+    MINIMIZE_ALL = "minimize_all"
+    SLEEP_DISPLAY = "sleep_display"
+    LOCK_SCREEN = "lock_screen"
 
 
-class OpenInstalledAppArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    app_name: str = Field(min_length=1, max_length=100)
+class _StrictArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
-class OpenWebsiteArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    url: str = Field(min_length=10, max_length=2048)
+class OpenTargetArgs(_StrictArgs):
+    target_alias: str = Field(min_length=1, max_length=80)
+
+
+class OpenInstalledAppArgs(_StrictArgs):
+    app_name: str = Field(min_length=1, max_length=80)
+
+
+class OpenWebsiteArgs(_StrictArgs):
+    url: str = Field(min_length=1, max_length=512)
     confirmed: bool = False
 
 
-class WebSearchArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+class CloseAppArgs(_StrictArgs):
+    app_alias: str = Field(min_length=1, max_length=80)
+    confirmed: bool = False
+
+
+class CloseAllAppsArgs(_StrictArgs):
+    except_aliases: list[str] = Field(default_factory=list, max_length=25)
+    confirmed: bool = False
+
+
+class ArrangeWindowsArgs(_StrictArgs):
+    mode: str | None = Field(default=None, min_length=1, max_length=80)
+    left: str | None = Field(default=None, min_length=1, max_length=80)
+    right: str | None = Field(default=None, min_length=1, max_length=80)
+    layout: Literal["50_50", "70_30", "30_70", "top_bottom"] = "50_50"
+
+
+class WebSearchArgs(_StrictArgs):
     query: str = Field(min_length=1, max_length=300)
     engine: Literal["google", "youtube"] = "google"
 
 
-class CloseAppArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    app_alias: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
-    confirmed: bool = False
-
-
-class CloseAllAppsArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    except_aliases: list[
-        Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")]
-    ] = Field(default_factory=list)
-    confirmed: bool = False
-
-
-class ArrangeWindowsArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    mode: str | None = Field(default=None, pattern=r"^[a-z0-9_]+$")
-    left: str | None = Field(default=None, pattern=r"^[a-z0-9_]+$")
-    right: str | None = Field(default=None, pattern=r"^[a-z0-9_]+$")
-    layout: LayoutType = "50_50"
-
-
-class SystemControlArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+class SystemControlArgs(_StrictArgs):
     action: SystemActionType
     value: int | None = Field(default=None, ge=0, le=100)
 
 
-class ReplyArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    message: str = Field(min_length=1, max_length=600)
+class ReplyArgs(_StrictArgs):
+    message: str = Field(min_length=1, max_length=1000)
     speak: bool = True
 
 
 class SandboxedExecutor:
+    """
+    Zero-arbitrary-shell macOS action executor with strict Pydantic schema validation,
+    0600 config permission verification, protected bundle blocking, and URL hardening.
+    """
+
+    DEFAULT_PROTECTED_BUNDLES = {
+        "com.apple.finder",
+        "com.apple.terminal",
+        "com.googlecode.iterm2",
+        "com.microsoft.vscode",
+        "com.vayu.agent",
+    }
+
+    APP_SEARCH_DIRS = (
+        Path("/Applications"),
+        Path.home() / "Applications",
+        Path("/System/Applications"),
+        Path("/System/Applications/Utilities"),
+    )
+
     def __init__(
         self,
-        aliases_path: Path = Path("config/aliases.json"),
-        protected_path: Path = Path("config/protected_bundles.json"),
+        aliases_path: str | Path = "config/aliases.json",
+        protected_path: str | Path = "config/protected_bundles.json",
         enforce_permissions: bool = True,
     ) -> None:
-        self.aliases_path = aliases_path
-        self.protected_bundles = self._load_protected_bundles(protected_path)
-        self.config = self._load_secure_aliases(aliases_path, enforce_permissions)
-        self.saved_bookmark_hosts = self._extract_bookmark_hosts()
+        self.aliases_path = Path(aliases_path)
+        self.protected_path = Path(protected_path)
+        self.enforce_permissions = enforce_permissions
 
-    @staticmethod
-    def _load_protected_bundles(path: Path) -> set[str]:
+        self.config: dict[str, Any] = self._load_aliases(self.aliases_path)
+        self.protected_bundle_ids: set[str] = self._load_protected_bundles(
+            self.protected_path
+        )
+
+    def _load_aliases(self, path: Path) -> dict[str, Any]:
         if not path.exists():
-            raise FileNotFoundError(f"Missing protected bundle list: {path}")
-        data = json.loads(path.read_text(encoding="utf-8"))
-        bundles = set(data.get("protected_bundle_ids", []))
-        if not bundles:
-            raise ValueError("Protected bundle list cannot be empty.")
-        return bundles
+            raise SecurityViolationError(f"Missing allowlist configuration: {path}")
 
-    @staticmethod
-    def _load_secure_aliases(path: Path, enforce_permissions: bool) -> dict[str, Any]:
-        if not path.exists():
-            raise FileNotFoundError(f"Missing allowlist config: {path}")
-
-        if enforce_permissions:
-            mode = stat.S_IMODE(os.stat(path).st_mode)
+        if self.enforce_permissions:
+            mode = stat.S_IMODE(path.stat().st_mode)
             if mode != 0o600:
                 raise SecurityViolationError(
-                    f"Insecure permissions on {path}: expected 0600, got {oct(mode)}. "
-                    f"Run: chmod 600 {path}"
+                    f"Insecure permissions {oct(mode)} on {path}; expected 0o600 (chmod 600)."
                 )
 
-        data = json.loads(path.read_text(encoding="utf-8"))
-        home_dir = Path.home().resolve()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise SecurityViolationError(f"Malformed JSON in {path}: {exc}") from exc
 
-        # Validate app targets are real .app bundles
-        for alias, entry in data.get("apps", {}).items():
-            app_path = Path(os.path.expanduser(entry["path"])).resolve()
-            if app_path.suffix != ".app":
-                raise SecurityViolationError(f"App alias '{alias}' must point to a .app bundle.")
-
-        # Validate folder targets stay inside user's home directory
-        for alias, entry in data.get("folders", {}).items():
-            folder_path = Path(os.path.expanduser(entry["path"])).resolve()
-            if home_dir not in folder_path.parents and folder_path != home_dir:
-                raise SecurityViolationError(
-                    f"Folder alias '{alias}' escapes user home directory."
-                )
-
+        if not isinstance(data, dict):
+            raise SecurityViolationError(f"Invalid root object in {path}")
         return data
 
-    def _extract_bookmark_hosts(self) -> set[str]:
+    def _load_protected_bundles(self, path: Path) -> set[str]:
+        protected = set(self.DEFAULT_PROTECTED_BUNDLES)
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                for bid in raw.get("protected_bundle_ids", []):
+                    if isinstance(bid, str) and bid.strip():
+                        protected.add(bid.strip().lower())
+            except Exception as exc:
+                raise SecurityViolationError(
+                    f"Malformed protected bundle configuration in {path}: {exc}"
+                ) from exc
+        return protected
+
+    def dispatch(self, tool_name: str, raw_args: dict[str, Any] | None = None) -> str:
+        args = dict(raw_args or {})
+        normalized_tool = (tool_name or "").strip().lower()
+
+        if normalized_tool in {"open_target", "open_app", "open_folder"}:
+            if set(args.keys()) == {"app_name"}:
+                args = {"target_alias": args["app_name"]}
+            elif set(args.keys()) == {"folder_name"}:
+                args = {"target_alias": args["folder_name"]}
+            validated = self._validate(OpenTargetArgs, args)
+            return self._open_target(validated.target_alias)
+
+        if normalized_tool == "open_installed_app":
+            validated = self._validate(OpenInstalledAppArgs, args)
+            return self._open_installed_app(validated.app_name)
+
+        if normalized_tool in {"open_website", "open_url"}:
+            validated = self._validate(OpenWebsiteArgs, args)
+            return self._open_website(validated.url, confirmed=validated.confirmed)
+
+        if normalized_tool == "close_app":
+            if set(args.keys()) <= {"app_name", "confirmed"} and "app_name" in args:
+                args["app_alias"] = args.pop("app_name")
+            validated = self._validate(CloseAppArgs, args)
+            return self._close_app(validated.app_alias, confirmed=validated.confirmed)
+
+        if normalized_tool == "close_all_apps":
+            validated = self._validate(CloseAllAppsArgs, args)
+            return self._close_all_apps(
+                except_aliases=validated.except_aliases,
+                confirmed=validated.confirmed,
+            )
+
+        if normalized_tool in {"arrange_windows", "split_screen", "run_mode"}:
+            if set(args.keys()) == {"mode_name"}:
+                args = {"mode": args["mode_name"]}
+            validated = self._validate(ArrangeWindowsArgs, args)
+            return self._arrange_windows(validated)
+
+        if normalized_tool == "web_search":
+            validated = self._validate(WebSearchArgs, args)
+            return self._web_search(validated.query, engine=validated.engine)
+
+        if normalized_tool == "system_control":
+            validated = self._validate(SystemControlArgs, args)
+            return self._system_control(validated.action, value=validated.value)
+
+        if normalized_tool == "reply":
+            if set(args.keys()) <= {"text", "speak"} and "text" in args:
+                args["message"] = args.pop("text")
+            validated = self._validate(ReplyArgs, args)
+            return self._reply(validated.message, speak=validated.speak)
+
+        raise SecurityViolationError(f"Unknown or disallowed tool: {tool_name}")
+
+    @staticmethod
+    def _validate(model_cls: type[BaseModel], args: dict[str, Any]) -> Any:
+        try:
+            return model_cls.model_validate(args)
+        except ValidationError as exc:
+            raise SecurityViolationError(f"Schema validation failed: {exc}") from exc
+
+    def _resolve_entry(
+        self, section: str, query: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        needle = query.strip().lower()
+        entries: dict[str, Any] = self.config.get(section, {})
+        for key, entry in entries.items():
+            if key.lower() == needle or key.lower().replace("_", " ") == needle:
+                return key, entry
+            spoken = [s.lower().strip() for s in entry.get("spoken_names", [])]
+            if needle in spoken:
+                return key, entry
+        return None
+
+    def _default_browser_bundle_id(self) -> str:
+        browser = self.config.get("default_browser", {})
+        bundle_id = browser.get("bundle_id", "com.apple.Safari")
+        if not isinstance(bundle_id, str) or not bundle_id.strip():
+            raise SecurityViolationError("Invalid default_browser bundle_id in config.")
+        return bundle_id.strip()
+
+    def _open_target(self, target_alias: str) -> str:
+        app_match = self._resolve_entry("apps", target_alias)
+        if app_match is not None:
+            canonical, entry = app_match
+            app_path = Path(os.path.expanduser(entry.get("path", "")))
+            if not app_path.exists():
+                raise SecurityViolationError(f"Application bundle not found: {app_path}")
+            subprocess.run(["open", str(app_path)], check=True, shell=False)
+            return f"Opened app: {canonical}"
+
+        folder_match = self._resolve_entry("folders", target_alias)
+        if folder_match is not None:
+            canonical, entry = folder_match
+            folder_path = Path(os.path.expanduser(entry.get("path", "")))
+            if not folder_path.exists() or not folder_path.is_dir():
+                raise SecurityViolationError(f"Folder path not found: {folder_path}")
+            subprocess.run(["open", str(folder_path)], check=True, shell=False)
+            return f"Opened folder: {canonical}"
+
+        bm_match = self._resolve_entry("bookmarks", target_alias)
+        if bm_match is not None:
+            canonical, entry = bm_match
+            clean_url, _ = self.validate_and_normalize_url(entry["url"])
+            browser_bid = self._default_browser_bundle_id()
+            subprocess.run(
+                ["open", "-b", browser_bid, clean_url], check=True, shell=False
+            )
+            return f"Opened website: {canonical}"
+
+        raise SecurityViolationError(f"Target not in allowlist: {target_alias}")
+
+    def _open_installed_app(self, app_name: str) -> str:
+        alias_match = self._resolve_entry("apps", app_name)
+        if alias_match is not None:
+            return self._open_target(alias_match[0])
+
+        needle = app_name.strip().lower().removesuffix(".app")
+        if not needle or "/" in needle or "\\" in needle or ".." in needle:
+            raise SecurityViolationError(f"Invalid application name: {app_name}")
+
+        for base_dir in self.APP_SEARCH_DIRS:
+            if not base_dir.is_dir():
+                continue
+            for candidate in base_dir.glob("*.app"):
+                if candidate.stem.lower() == needle:
+                    subprocess.run(["open", str(candidate)], check=True, shell=False)
+                    return f"Opened installed app: {candidate.stem}"
+
+        raise SecurityViolationError(f"Installed application not found: {app_name}")
+
+    def _bookmarked_hosts(self) -> set[str]:
         hosts: set[str] = set()
         for entry in self.config.get("bookmarks", {}).values():
-            parsed = urlparse(entry["url"])
+            raw_url = str(entry.get("url", "")).strip()
+            if not raw_url:
+                continue
+            parsed = urlsplit(raw_url)
             if parsed.hostname:
-                ascii_host = parsed.hostname.encode("idna").decode("ascii").lower()
-                hosts.add(ascii_host)
+                try:
+                    ascii_host = (
+                        parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+                    )
+                    hosts.add(ascii_host)
+                    hosts.add(ascii_host.removeprefix("www."))
+                except UnicodeError:
+                    continue
         return hosts
 
     def validate_and_normalize_url(self, raw_url: str) -> tuple[str, bool]:
-        """Validates HTTPS URLs, normalizes punycode, blocks local IPs, and flags unbookmarked hosts."""
-        parsed = urlparse(raw_url.strip())
-        if parsed.scheme != "https" or not parsed.hostname:
-            raise SecurityViolationError("Only explicit HTTPS URLs with valid hostnames are allowed.")
-        if parsed.username or parsed.password or "@" in parsed.netloc:
-            raise SecurityViolationError("URLs containing userinfo (@) are blocked.")
-        if parsed.port not in (None, 443):
-            raise SecurityViolationError("Non-standard HTTPS ports are blocked.")
+        """
+        Enforces strict HTTPS, rejects userinfo (@) and private/loopback IPs,
+        normalizes IDNA/punycode hostnames, and returns (normalized_url, needs_confirmation).
+        """
+        candidate = raw_url.strip()
+        parsed = urlsplit(candidate)
+        if parsed.scheme.lower() != "https":
+            raise SecurityViolationError(
+                f"Blocked non-HTTPS URL scheme: {parsed.scheme!r}"
+            )
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or "@" in parsed.netloc
+        ):
+            raise SecurityViolationError("Blocked URL containing userinfo credentials.")
+
+        hostname = parsed.hostname
+        if not hostname:
+            raise SecurityViolationError("Blocked URL with missing hostname.")
 
         try:
-            ascii_host = parsed.hostname.encode("idna").decode("ascii").lower()
+            ascii_host = hostname.encode("idna").decode("ascii").lower().rstrip(".")
         except UnicodeError as exc:
-            raise SecurityViolationError("Invalid IDN/punycode hostname.") from exc
+            raise SecurityViolationError(f"Invalid IDNA hostname: {hostname}") from exc
+
+        if not ascii_host or ascii_host == "localhost" or ascii_host.endswith(".local"):
+            raise SecurityViolationError(f"Blocked local hostname: {ascii_host}")
 
         try:
-            ip = ipaddress.ip_address(ascii_host)
+            ip_obj = ipaddress.ip_address(ascii_host)
             if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
+                ip_obj.is_loopback
+                or ip_obj.is_private
+                or ip_obj.is_link_local
+                or ip_obj.is_reserved
+                or ip_obj.is_multicast
+                or ip_obj.is_unspecified
             ):
-                raise SecurityViolationError("Private, loopback, or reserved IP targets are blocked.")
-        except ValueError as err:
-            if "blocked" in str(err):
-                raise
+                raise SecurityViolationError(
+                    f"Blocked non-public IP address: {ascii_host}"
+                )
+        except ValueError:
+            if "." not in ascii_host:
+                raise SecurityViolationError(f"Blocked single-label host: {ascii_host}")
 
-        clean_url = parsed._replace(netloc=ascii_host).geturl()
-        requires_confirm = ascii_host not in self.saved_bookmark_hosts
-        return clean_url, requires_confirm
+        netloc = f"{ascii_host}:{parsed.port}" if parsed.port else ascii_host
+        normalized_url = urlunsplit(
+            ("https", netloc, parsed.path or "", parsed.query, parsed.fragment)
+        )
+        known_hosts = self._bookmarked_hosts()
+        is_bookmarked = (
+            ascii_host in known_hosts
+            or ascii_host.removeprefix("www.") in known_hosts
+        )
+        return normalized_url, not is_bookmarked
 
-    def dispatch(self, tool_name: str, raw_args: dict[str, Any]) -> str:
-        """Single fail-closed entry point for all local and LLM-routed tool calls."""
-        try:
-            if tool_name == "open_target":
-                args = OpenTargetArgs.model_validate(raw_args)
-                return self._open_target(args.target_alias)
-
-            if tool_name == "open_installed_app":
-                args = OpenInstalledAppArgs.model_validate(raw_args)
-                return self._open_installed_app(args.app_name)
-
-            if tool_name == "open_website":
-                args = OpenWebsiteArgs.model_validate(raw_args)
-                return self._open_website(args.url, args.confirmed)
-
-            if tool_name == "web_search":
-                args = WebSearchArgs.model_validate(raw_args)
-                return self._web_search(args.query, args.engine)
-
-            if tool_name == "close_app":
-                args = CloseAppArgs.model_validate(raw_args)
-                return self._close_app(args.app_alias, args.confirmed)
-
-            if tool_name == "close_all_apps":
-                args = CloseAllAppsArgs.model_validate(raw_args)
-                return self._close_all_apps(args.except_aliases, args.confirmed)
-
-            if tool_name == "arrange_windows":
-                args = ArrangeWindowsArgs.model_validate(raw_args)
-                return self._arrange_windows(args)
-
-            if tool_name == "system_control":
-                args = SystemControlArgs.model_validate(raw_args)
-                return self._system_control(args.action, args.value)
-
-            if tool_name == "reply":
-                args = ReplyArgs.model_validate(raw_args)
-                return self._reply(args.message, args.speak)
-
-            raise SecurityViolationError(f"Unknown or unallowlisted tool: {tool_name}")
-
-        except ValidationError as exc:
-            raise SecurityViolationError("Tool schema validation failed (fail-closed).") from exc
-
-    def _get_running_gui_targets(self) -> list[tuple[str, str]]:
-        """Queries macOS NSWorkspace natively for open non-protected GUI apps [(alias_or_name, bundle_id)]."""
-        try:
-            from AppKit import NSWorkspace
-        except ImportError:
-            return []
-
-        bundle_to_alias = {
-            entry["bundle_id"]: alias
-            for alias, entry in self.config.get("apps", {}).items()
-            if "bundle_id" in entry
-        }
-        always_protected = self.protected_bundles | {
-            "com.vayu.agent",
-            "org.python.python",
-        }
-        if os.environ.get("TERM_PROGRAM") == "vscode":
-            always_protected.add("com.microsoft.VSCode")
-
-        targets: list[tuple[str, str]] = []
-        seen_bundles: set[str] = set()
-
-        for app in NSWorkspace.sharedWorkspace().runningApplications():
-            if int(app.activationPolicy()) != 0:
-                continue
-            bundle_id = str(app.bundleIdentifier() or "").strip()
-            if not bundle_id or bundle_id in always_protected or bundle_id in seen_bundles:
-                continue
-            seen_bundles.add(bundle_id)
-            proc_name = str(app.localizedName() or bundle_id).strip()
-            label = bundle_to_alias.get(bundle_id, proc_name.lower())
-            targets.append((label, bundle_id))
-
-        return targets
-
-    def get_running_apps(self) -> list[str]:
-        """Provides live non-protected open app context to HybridBrain."""
-        return [label for label, _ in self._get_running_gui_targets()]
-
-    def _open_target(self, alias: str) -> str:
-        apps = self.config.get("apps", {})
-        folders = self.config.get("folders", {})
-        bookmarks = self.config.get("bookmarks", {})
-
-        if alias in apps:
-            app_path = Path(os.path.expanduser(apps[alias]["path"])).resolve()
-            if not app_path.exists():
-                raise FileNotFoundError(f"Application bundle not found: {app_path}")
-            subprocess.run(["open", str(app_path)], check=True, shell=False)
-            return f"Opened app: {alias}"
-
-        if alias in folders:
-            folder_path = Path(os.path.expanduser(folders[alias]["path"])).resolve()
-            if not folder_path.is_dir():
-                raise FileNotFoundError(f"Folder not found: {folder_path}")
-            subprocess.run(["open", str(folder_path)], check=True, shell=False)
-            return f"Opened folder: {alias}"
-
-        if alias in bookmarks:
-            return self._open_website(bookmarks[alias]["url"], confirmed=True)
-
-        raise SecurityViolationError(f"Target '{alias}' is not in aliases.json allowlist.")
-
-    def _open_installed_app(self, app_name: str) -> str:
-        """Dynamically discovers and opens any installed macOS .app bundle by name."""
-        cleaned = app_name.strip().lower().removesuffix(".app")
-        if not cleaned:
-            raise SecurityViolationError("Empty application name.")
-
-        # Check allowlist spoken names first
-        for alias, entry in self.config.get("apps", {}).items():
-            spoken = [alias.lower()] + [s.lower() for s in entry.get("spoken_names", [])]
-            if cleaned in spoken:
-                return self._open_target(alias)
-
-        search_dirs = [
-            Path("/Applications"),
-            Path.home() / "Applications",
-            Path("/System/Applications"),
-            Path("/System/Applications/Utilities"),
-        ]
-        discovered: dict[str, Path] = {}
-        for base_dir in search_dirs:
-            if not base_dir.is_dir():
-                continue
-            for item in base_dir.iterdir():
-                if item.suffix == ".app":
-                    discovered[item.stem.lower()] = item.resolve()
-
-        target_bundle: Path | None = discovered.get(cleaned)
-        if target_bundle is None:
-            matches = difflib.get_close_matches(
-                cleaned, list(discovered.keys()), n=1, cutoff=0.75
+    def _open_website(self, url_or_alias: str, confirmed: bool = False) -> str:
+        bm_match = self._resolve_entry("bookmarks", url_or_alias)
+        if bm_match is not None:
+            canonical, entry = bm_match
+            clean_url, _ = self.validate_and_normalize_url(entry["url"])
+            browser_bid = self._default_browser_bundle_id()
+            subprocess.run(
+                ["open", "-b", browser_bid, clean_url], check=True, shell=False
             )
-            if matches:
-                target_bundle = discovered[matches[0]]
+            return f"Opened website: {canonical}"
 
-        if target_bundle is None or not target_bundle.exists():
-            raise FileNotFoundError(
-                f"No installed macOS application matching '{app_name}' found."
-            )
+        candidate = url_or_alias.strip()
+        if ":" not in candidate:
+            candidate = f"https://{candidate}"
 
-        subprocess.run(["open", str(target_bundle)], check=True, shell=False)
-        return f"Opened installed app: {target_bundle.stem}"
-
-    def _open_website(self, raw_url: str, confirmed: bool, new_window: bool = False) -> str:
-        clean_url, needs_confirm = self.validate_and_normalize_url(raw_url)
+        clean_url, needs_confirm = self.validate_and_normalize_url(candidate)
         if needs_confirm and not confirmed:
             raise ConfirmationRequiredError(
-                prompt=f"Open unbookmarked domain {urlparse(clean_url).hostname}?",
-                action_payload={"tool": "open_website", "args": {"url": clean_url, "confirmed": True}},
-            )
-
-        browser = self.config["default_browser"]
-        browser_bundle = browser["bundle_id"]
-        browser_path = str(Path(os.path.expanduser(browser["path"])).resolve())
-
-        if new_window:
-            if browser_bundle == "com.apple.Safari":
-                script = """
-                on run argv
-                    set targetUrl to item 1 of argv
-                    tell application id "com.apple.Safari"
-                        activate
-                        make new document with properties {URL:targetUrl}
-                    end tell
-                end run
-                """
-                subprocess.run(["osascript", "-e", script, clean_url], check=True, shell=False)
-            else:
-                subprocess.run(
-                    ["open", "-na", browser_path, "--args", "--new-window", clean_url],
-                    check=True,
-                    shell=False,
-                )
-        else:
-            subprocess.run(["open", "-a", browser_path, clean_url], check=True, shell=False)
-
-        return f"Opened website: {clean_url}"
-
-    def _web_search(self, query: str, engine: Literal["google", "youtube"]) -> str:
-        encoded = quote_plus(query.strip())
-        if engine == "youtube":
-            url = f"https://www.youtube.com/results?search_query={encoded}"
-        else:
-            url = f"https://www.google.com/search?q={encoded}"
-
-        browser_path = str(
-            Path(os.path.expanduser(self.config["default_browser"]["path"])).resolve()
-        )
-        subprocess.run(["open", "-a", browser_path, url], check=True, shell=False)
-        return f"Searched {engine.title()} for '{query.strip()}'"
-
-    def _close_app(self, app_alias: str, confirmed: bool) -> str:
-        apps = self.config.get("apps", {})
-        if app_alias not in apps:
-            raise SecurityViolationError(f"App '{app_alias}' is not in aliases.json allowlist.")
-
-        bundle_id = apps[app_alias]["bundle_id"]
-        if bundle_id in self.protected_bundles:
-            raise SecurityViolationError(f"Blocked quit on protected bundle: {bundle_id}")
-
-        if not confirmed:
-            raise ConfirmationRequiredError(
-                prompt=f"Confirm quitting {app_alias}?",
-                action_payload={"tool": "close_app", "args": {"app_alias": app_alias, "confirmed": True}},
-            )
-
-        applescript = """
-        on run argv
-            set targetBundle to item 1 of argv
-            tell application id targetBundle to quit
-        end run
-        """
-        subprocess.run(["osascript", "-e", applescript, bundle_id], check=True, shell=False)
-        return f"Closed app: {app_alias}"
-
-    def _close_all_apps(self, except_aliases: list[str], confirmed: bool) -> str:
-        apps = self.config.get("apps", {})
-        excluded_bundles: set[str] = set()
-        for alias in except_aliases:
-            if alias not in apps:
-                raise SecurityViolationError(
-                    f"Exception app '{alias}' is not in aliases.json allowlist."
-                )
-            excluded_bundles.add(apps[alias]["bundle_id"])
-
-        targets = [
-            (label, bundle_id)
-            for label, bundle_id in self._get_running_gui_targets()
-            if bundle_id not in excluded_bundles
-        ]
-        if not targets:
-            return "No open non-protected apps to close."
-
-        labels = [label for label, _ in targets]
-        if not confirmed:
-            raise ConfirmationRequiredError(
-                prompt=f"Confirm quitting {len(targets)} open app(s): {', '.join(labels)}?",
+                prompt=f"Open unbookmarked website {clean_url}?",
                 action_payload={
-                    "tool": "close_all_apps",
-                    "args": {"except_aliases": except_aliases, "confirmed": True},
+                    "tool": "open_website",
+                    "args": {"url": clean_url, "confirmed": True},
                 },
             )
 
-        applescript = """
-        on run argv
-            set targetBundle to item 1 of argv
-            tell application id targetBundle to quit
-        end run
-        """
-        for _, bundle_id in targets:
+        browser_bid = self._default_browser_bundle_id()
+        subprocess.run(["open", "-b", browser_bid, clean_url], check=True, shell=False)
+        return f"Opened website: {clean_url}"
+
+    def _close_app(self, app_alias: str, confirmed: bool = False) -> str:
+        resolved = self._resolve_entry("apps", app_alias)
+        if resolved is None:
+            raise SecurityViolationError(f"Application not in allowlist: {app_alias}")
+
+        canonical_name, entry = resolved
+        bundle_id = str(entry.get("bundle_id", "")).strip()
+        if not bundle_id:
+            raise SecurityViolationError(f"Missing bundle_id for {canonical_name}")
+
+        if bundle_id.lower() in self.protected_bundle_ids:
+            raise SecurityViolationError(
+                f"Blocked attempt to quit protected bundle: {bundle_id}"
+            )
+
+        if not confirmed:
+            raise ConfirmationRequiredError(
+                prompt=f"Quit {canonical_name} ({bundle_id})?",
+                action_payload={
+                    "tool": "close_app",
+                    "args": {"app_alias": canonical_name, "confirmed": True},
+                },
+            )
+
+        quit_script = (
+            "on run argv\n"
+            "  set targetBundleId to item 1 of argv\n"
+            "  tell application id targetBundleId to quit\n"
+            "end run"
+        )
+        subprocess.run(
+            ["osascript", "-e", quit_script, bundle_id],
+            check=True,
+            shell=False,
+        )
+        return f"Closed app: {canonical_name}"
+
+    def _close_all_apps(
+        self, except_aliases: list[str] | None = None, confirmed: bool = False
+    ) -> str:
+        from AppKit import NSWorkspace
+
+        exempt_bundles = set(self.protected_bundle_ids)
+        for alias in except_aliases or []:
+            resolved = self._resolve_entry("apps", alias)
+            if resolved and resolved[1].get("bundle_id"):
+                exempt_bundles.add(str(resolved[1]["bundle_id"]).strip().lower())
+
+        targets: list[tuple[str, str]] = []
+        for running_app in NSWorkspace.sharedWorkspace().runningApplications():
+            if running_app.activationPolicy() != 0:
+                continue
+            bid = str(running_app.bundleIdentifier() or "").strip()
+            if not bid or bid.lower() in exempt_bundles:
+                continue
+            name = str(running_app.localizedName() or bid)
+            targets.append((name, bid))
+
+        if not targets:
+            return "No non-protected GUI apps are currently open."
+
+        if not confirmed:
+            names_preview = ", ".join(name for name, _ in targets)
+            raise ConfirmationRequiredError(
+                prompt=f"Quit all open apps ({names_preview})?",
+                action_payload={
+                    "tool": "close_all_apps",
+                    "args": {
+                        "except_aliases": list(except_aliases or []),
+                        "confirmed": True,
+                    },
+                },
+            )
+
+        quit_script = (
+            "on run argv\n"
+            "  repeat with bid in argv\n"
+            "    tell application id (bid as text) to quit\n"
+            "  end repeat\n"
+            "end run"
+        )
+        subprocess.run(
+            ["osascript", "-e", quit_script, *(bid for _, bid in targets)],
+            check=True,
+            shell=False,
+        )
+        closed_names = ", ".join(name for name, _ in targets)
+        return f"Closed apps: {closed_names}"
+
+    def _get_desktop_bounds(self) -> tuple[int, int, int, int]:
+        """Returns (left, top, right, bottom) screen coordinates via Finder desktop bounds."""
+        raw = subprocess.check_output(
+            [
+                "osascript",
+                "-e",
+                'tell application "Finder" to get bounds of window of desktop',
+            ],
+            text=True,
+        ).strip()
+        parts = [int(p.strip()) for p in raw.split(",")]
+        if len(parts) != 4:
+            return (0, 25, 1440, 900)
+        return (parts[0], max(parts[1], 25), parts[2], parts[3])
+
+    def _launch_split_target(self, target: str) -> tuple[str, str]:
+        app_match = self._resolve_entry("apps", target)
+        if app_match is not None:
+            canonical_name, entry = app_match
+            app_path = Path(os.path.expanduser(entry.get("path", "")))
+            if not app_path.exists():
+                raise SecurityViolationError(f"Application bundle not found: {app_path}")
+            bundle_id = str(entry.get("bundle_id", "")).strip()
+            if not bundle_id:
+                raise SecurityViolationError(f"Missing bundle_id for {canonical_name}")
+            subprocess.run(["open", "-b", bundle_id], check=True, shell=False)
+            return canonical_name, bundle_id
+
+        bm_match = self._resolve_entry("bookmarks", target)
+        if bm_match is not None:
+            canonical_name, entry = bm_match
+            clean_url, _ = self.validate_and_normalize_url(entry["url"])
+            browser_bid = self._default_browser_bundle_id()
             subprocess.run(
-                ["osascript", "-e", applescript, bundle_id],
-                check=True,
-                shell=False,
+                ["open", "-b", browser_bid, clean_url], check=True, shell=False
             )
-        return f"Closed {len(targets)} app(s): {', '.join(labels)}"
+            return canonical_name, browser_bid
 
-    def _system_control(self, action: SystemActionType, value: int | None) -> str:
-        if action == "set_volume":
-            level = 50 if value is None else value
-            script = """
-            on run argv
-                set volLevel to (item 1 of argv) as integer
-                set volume output volume volLevel without output muted
-            end run
-            """
-            subprocess.run(["osascript", "-e", script, str(level)], check=True, shell=False)
-            return f"Set volume to {level}%"
-
-        if action in ("volume_up", "volume_down"):
-            delta = 15 if action == "volume_up" else -15
-            script = f"""
-            set curVol to output volume of (get volume settings)
-            set nextVol to curVol + ({delta})
-            if nextVol > 100 then set nextVol to 100
-            if nextVol < 0 then set nextVol to 0
-            set volume output volume nextVol without output muted
-            return nextVol
-            """
-            res = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                check=True,
-                shell=False,
-            )
-            return f"Volume adjusted to {res.stdout.strip()}%"
-
-        if action == "mute":
-            subprocess.run(
-                ["osascript", "-e", "set volume with output muted"],
-                check=True,
-                shell=False,
-            )
-            return "Muted system audio"
-
-        if action == "unmute":
-            subprocess.run(
-                ["osascript", "-e", "set volume without output muted"],
-                check=True,
-                shell=False,
-            )
-            return "Unmuted system audio"
-
-        if action == "dark_mode_toggle":
-            script = 'tell application "System Events" to tell appearance preferences to set dark mode to not dark mode'
-            subprocess.run(["osascript", "-e", script], check=True, shell=False)
-            return "Toggled macOS Dark Mode"
-
-        if action == "screenshot":
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = Path.home() / "Desktop" / f"Vayu_Screenshot_{ts}.png"
-            subprocess.run(["screencapture", "-x", str(out_path)], check=True, shell=False)
-            return f"Saved screenshot to Desktop/{out_path.name}"
-
-        if action == "minimize_all":
-            script = """
-            tell application "System Events"
-                set visible of every process whose visible is true and background only is false and bundle identifier is not "com.apple.finder" and bundle identifier is not "com.microsoft.VSCode" and bundle identifier is not "com.apple.Terminal" to false
-            end tell
-            """
-            subprocess.run(["osascript", "-e", script], check=True, shell=False)
-            return "Minimized open windows to show Desktop"
-
-        raise SecurityViolationError(f"Unsupported system control: {action}")
-
-    @staticmethod
-    def _reply(message: str, speak: bool) -> str:
-        clean_msg = message.strip()
-        if speak and clean_msg:
-            subprocess.Popen(
-                ["say", "-r", "195", clean_msg],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        return clean_msg
-
-    def _resolve_split_side(self, alias: str) -> tuple[str, int]:
-        """Launches target (isolated browser window if bookmark) and returns (bundle_id, window_index)."""
-        apps = self.config.get("apps", {})
-        bookmarks = self.config.get("bookmarks", {})
-        browser_bundle = self.config["default_browser"]["bundle_id"]
-
-        if alias in apps:
-            self._open_target(alias)
-            return apps[alias]["bundle_id"], 1
-
-        if alias in bookmarks:
-            self._open_website(bookmarks[alias]["url"], confirmed=True, new_window=True)
-            return browser_bundle, 1
-
-        raise SecurityViolationError(f"Split-screen target '{alias}' must be an allowlisted app or bookmark.")
+        raise SecurityViolationError(f"Split-screen target not in allowlist: {target}")
 
     def _arrange_windows(self, args: ArrangeWindowsArgs) -> str:
         if args.mode:
-            modes = self.config.get("modes", {})
-            if args.mode not in modes:
-                raise SecurityViolationError(f"Mode '{args.mode}' is not defined in aliases.json.")
-            preset = modes[args.mode]
-            left_alias = preset["left"]
-            right_alias = preset["right"]
-            layout: LayoutType = preset.get("layout", args.layout)
-        else:
-            if not args.left or not args.right:
-                raise SecurityViolationError("Split screen requires either 'mode' or both 'left' and 'right'.")
-            left_alias = args.left
-            right_alias = args.right
-            layout = args.layout
+            mode_match = self._resolve_entry("modes", args.mode)
+            if mode_match is None:
+                raise SecurityViolationError(
+                    f"Workspace mode not in allowlist: {args.mode}"
+                )
+            canonical_mode, mode_cfg = mode_match
+            for pre_target in mode_cfg.get("open_before", []):
+                self._open_target(pre_target)
+            if "left" in mode_cfg and "right" in mode_cfg:
+                return self._split_pair(
+                    mode_cfg["left"],
+                    mode_cfg["right"],
+                    layout=mode_cfg.get("layout", "50_50"),
+                )
+            if "split" in mode_cfg:
+                sp = mode_cfg["split"]
+                return self._split_pair(
+                    sp["left"], sp["right"], layout=sp.get("layout", "50_50")
+                )
+            outcomes = [
+                self.dispatch(step["tool"], step.get("args", {}))
+                for step in mode_cfg.get("actions", [])
+            ]
+            return " | ".join(outcomes) if outcomes else f"Activated mode: {canonical_mode}"
 
-        left_bundle, left_win_idx = self._resolve_split_side(left_alias)
-        right_bundle, right_win_idx = self._resolve_split_side(right_alias)
+        if not args.left or not args.right:
+            raise SecurityViolationError(
+                "arrange_windows requires either 'mode' or both 'left' and 'right'."
+            )
+        return self._split_pair(args.left, args.right, layout=args.layout)
 
-        # If both sides are websites in the same browser, left is now window 2 and right is window 1
-        if left_bundle == right_bundle:
-            left_win_idx = 2
-            right_win_idx = 1
+    def _split_pair(
+        self,
+        left: str,
+        right: str,
+        layout: Literal["50_50", "70_30", "30_70", "top_bottom"] = "50_50",
+    ) -> str:
+        left_name, left_bid = self._launch_split_target(left)
+        right_name, right_bid = self._launch_split_target(right)
 
-        left_rect, right_rect = self._compute_split_rects(layout)
-        self._tile_window(left_bundle, left_win_idx, *left_rect)
-        self._tile_window(right_bundle, right_win_idx, *right_rect)
-        return f"Tiled {left_alias} and {right_alias} ({layout})"
-
-    def _get_desktop_bounds(self) -> tuple[int, int, int, int]:
-        script = """
-        tell application "Finder"
-            set b to bounds of window of desktop
-            return (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text)
-        end tell
-        """
-        result = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, check=True, shell=False
-        )
-        parts = [int(p.strip()) for p in result.stdout.strip().split(",")]
-        return parts[0], max(parts[1], 28), parts[2], parts[3]
-
-    def _compute_split_rects(
-        self, layout: LayoutType
-    ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
-        x0, y0, x1, y1 = self._get_desktop_bounds()
-        total_w = x1 - x0
-        total_h = y1 - y0
+        min_x, min_y, max_x, max_y = self._get_desktop_bounds()
+        width = max_x - min_x
+        height = max_y - min_y
 
         if layout == "top_bottom":
-            half_h = total_h // 2
-            return (x0, y0, total_w, half_h), (x0, y0 + half_h, total_w, total_h - half_h)
+            mid_y = min_y + (height // 2)
+            l_x, l_y, l_w, l_h = min_x, min_y, width, mid_y - min_y
+            r_x, r_y, r_w, r_h = min_x, mid_y, width, max_y - mid_y
+        else:
+            ratio = {"70_30": 0.7, "30_70": 0.3}.get(layout, 0.5)
+            split_x = min_x + int(width * ratio)
+            l_x, l_y, l_w, l_h = min_x, min_y, split_x - min_x, height
+            r_x, r_y, r_w, r_h = split_x, min_y, max_x - split_x, height
 
-        ratio = {"50_50": 0.5, "70_30": 0.7, "30_70": 0.3}[layout]
-        left_w = int(total_w * ratio)
-        right_w = total_w - left_w
-        return (x0, y0, left_w, total_h), (x0 + left_w, y0, right_w, total_h)
-
-    @staticmethod
-    def _tile_window(bundle_id: str, win_index: int, x: int, y: int, width: int, height: int) -> None:
-        applescript = """
-        on run argv
-            set targetBundle to item 1 of argv
-            set winIdx to (item 2 of argv) as integer
-            set xPos to (item 3 of argv) as integer
-            set yPos to (item 4 of argv) as integer
-            set winW to (item 5 of argv) as integer
-            set winH to (item 6 of argv) as integer
-
-            tell application id targetBundle to activate
-            delay 0.25
-
-            tell application "System Events"
-                set targetProc to first application process whose bundle identifier is targetBundle
-                set frontmost of targetProc to true
-                if (count of windows of targetProc) >= winIdx then
-                    set targetWin to window winIdx of targetProc
-                    set position of targetWin to {xPos, yPos}
-                    set size of targetWin to {winW, winH}
-                end if
-            end tell
-        end run
-        """
+        tile_script = (
+            "on run argv\n"
+            "  set leftId to item 1 of argv\n"
+            "  set rightId to item 2 of argv\n"
+            "  set lx to (item 3 of argv) as integer\n"
+            "  set ly to (item 4 of argv) as integer\n"
+            "  set lw to (item 5 of argv) as integer\n"
+            "  set lh to (item 6 of argv) as integer\n"
+            "  set rx to (item 7 of argv) as integer\n"
+            "  set ry to (item 8 of argv) as integer\n"
+            "  set rw to (item 9 of argv) as integer\n"
+            "  set rh to (item 10 of argv) as integer\n"
+            '  tell application "System Events"\n'
+            "    set leftProcs to every process whose bundle identifier is leftId\n"
+            "    if (count of leftProcs) > 0 then\n"
+            "      tell item 1 of leftProcs\n"
+            "        if (count of windows) > 0 then\n"
+            "          set position of window 1 to {lx, ly}\n"
+            "          set size of window 1 to {lw, lh}\n"
+            "        end if\n"
+            "      end tell\n"
+            "    end if\n"
+            "    set rightProcs to every process whose bundle identifier is rightId\n"
+            "    if (count of rightProcs) > 0 then\n"
+            "      tell item 1 of rightProcs\n"
+            "        if (count of windows) > 0 then\n"
+            "          set position of window 1 to {rx, ry}\n"
+            "          set size of window 1 to {rw, rh}\n"
+            "        end if\n"
+            "      end tell\n"
+            "    end if\n"
+            "  end tell\n"
+            "end run"
+        )
         subprocess.run(
             [
                 "osascript",
                 "-e",
-                applescript,
-                bundle_id,
-                str(win_index),
-                str(x),
-                str(y),
-                str(width),
-                str(height),
+                tile_script,
+                left_bid,
+                right_bid,
+                str(l_x),
+                str(l_y),
+                str(l_w),
+                str(l_h),
+                str(r_x),
+                str(r_y),
+                str(r_w),
+                str(r_h),
             ],
             check=True,
             shell=False,
         )
+        return f"Tiled {left_name} and {right_name} ({layout})"
+
+    def _web_search(
+        self, query: str, engine: Literal["google", "youtube"] = "google"
+    ) -> str:
+        encoded = quote_plus(query.strip())
+        if engine == "youtube":
+            target_url = f"https://www.youtube.com/results?search_query={encoded}"
+        else:
+            target_url = f"https://www.google.com/search?q={encoded}"
+
+        browser_bid = self._default_browser_bundle_id()
+        subprocess.run(["open", "-b", browser_bid, target_url], check=True, shell=False)
+        return f"Searched {engine.capitalize()} for: {query.strip()}"
+
+    @staticmethod
+    def _system_control(action: SystemActionType, value: int | None = None) -> str:
+        if action == SystemActionType.SCREENSHOT:
+            out_path = Path.home() / "Desktop" / "vayu_screenshot.png"
+            subprocess.run(
+                ["screencapture", "-x", str(out_path)], check=True, shell=False
+            )
+            return f"Saved screenshot to {out_path}"
+
+        if action == SystemActionType.SET_VOLUME:
+            level = 50 if value is None else value
+            script = f"set volume output volume {level}"
+        else:
+            scripts = {
+                SystemActionType.VOLUME_UP: "set volume output volume ((output volume of (get volume settings)) + 10)",
+                SystemActionType.VOLUME_DOWN: "set volume output volume ((output volume of (get volume settings)) - 10)",
+                SystemActionType.MUTE: "set volume with output muted",
+                SystemActionType.UNMUTE: "set volume without output muted",
+                SystemActionType.DARK_MODE_TOGGLE: 'tell application "System Events" to tell appearance preferences to set dark mode to not dark mode',
+                SystemActionType.MINIMIZE_ALL: 'tell application "System Events" to set visible of every process whose visible is true and bundle identifier is not "com.apple.finder" to false',
+                SystemActionType.SLEEP_DISPLAY: 'do shell script "pmset displaysleepnow"',
+                SystemActionType.LOCK_SCREEN: 'tell application "System Events" to keystroke "q" using {control down, command down}',
+            }
+            script = scripts[action]
+
+        subprocess.run(["osascript", "-e", script], check=True, shell=False)
+        return f"Executed system action: {action.value}"
+
+    @staticmethod
+    def _reply(message: str, speak: bool = True) -> str:
+        clean_msg = message.strip()
+        if speak and clean_msg and shutil.which("say") is not None:
+            cmd = ["say"]
+            try:
+                from core.voice import _resolve_friday_voice
+
+                voice_name = _resolve_friday_voice()
+                if voice_name:
+                    cmd.extend(["-v", voice_name])
+            except Exception:
+                pass
+            cmd.extend(["-r", "195", clean_msg])
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return clean_msg

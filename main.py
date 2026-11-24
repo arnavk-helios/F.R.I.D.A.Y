@@ -8,6 +8,7 @@ from core.audio_engine import AudioEngine
 from core.brain import HybridBrain
 from core.executor import SandboxedExecutor
 from core.local_parser import DeterministicLocalParser
+from core.voice import JarvisVoice
 from ui.hud_overlay import AssistantState, HUDController
 from ui.menubar import VayuController
 
@@ -26,7 +27,10 @@ def _play_wake_chime() -> None:
 def build_vayu_controller(enable_native_window: bool = True) -> VayuController:
     executor = SandboxedExecutor()
     parser = DeterministicLocalParser(executor.config)
-    audio = AudioEngine()
+    friday_model = Path("models/hey_friday.onnx")
+    audio = AudioEngine(
+        wakeword_model_paths=[str(friday_model)] if friday_model.exists() else None
+    )
 
     hud = HUDController(
         on_kill_mic=audio.disable_mic,
@@ -37,7 +41,10 @@ def build_vayu_controller(enable_native_window: bool = True) -> VayuController:
         parser=parser,
         audio_engine=audio,
         hud=hud,
+        voice=JarvisVoice(enabled=enable_native_window),
     )
+    hud.on_kill_mic = controller.engage_hard_off
+
     brain = HybridBrain(
         executor=executor,
         parser=parser,
@@ -46,7 +53,6 @@ def build_vayu_controller(enable_native_window: bool = True) -> VayuController:
     )
     controller.fallback_router = brain.route
 
-    # Play audible chime on wake trigger while preserving controller wake state
     orig_on_wake = audio.on_wake_confirm
 
     def _on_wake_with_chime(label: str, score: float) -> bool:
@@ -57,7 +63,6 @@ def build_vayu_controller(enable_native_window: bool = True) -> VayuController:
 
     audio.on_wake_confirm = _on_wake_with_chime
 
-    # Log every executed action outcome in the terminal
     orig_process = controller.process_transcript
 
     def _logged_process_transcript(raw_transcript: str) -> str:
@@ -97,7 +102,7 @@ def run_menubar(auto_listen: bool = False) -> None:
                     AssistantState.ACTIVE, self.controller.cloud_mode_enabled
                 )
                 print(
-                    "[Vayu] Microphone ACTIVE (🟢) — say 'Hey Jarvis' followed by your command."
+                    "[Vayu] Microphone ACTIVE (🟢) — say 'Hey Friday' (or 'Hey Jarvis' until models/hey_friday.onnx is added) followed by your command."
                 )
 
         def _on_state_change(self, state: AssistantState, cloud_enabled: bool) -> None:

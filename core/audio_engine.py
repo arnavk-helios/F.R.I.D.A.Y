@@ -84,7 +84,7 @@ class AudioEngine:
         self,
         config: AudioConfig | None = None,
         manifest_path: Path = Path("config/model_hashes.json"),
-        wakeword_model_paths: list[str] | None = None,
+        wakeword_model_paths: list[str] | None = ["models/hey_friday.onnx"],
         on_wake_confirm: Callable[[str, float], bool] | None = None,
         on_transcript: Callable[[str], None] | None = None,
     ) -> None:

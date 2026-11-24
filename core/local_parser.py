@@ -88,7 +88,7 @@ class DeterministicLocalParser:
     def _normalize_transcript(raw_text: str) -> str:
         text = raw_text.strip().lower()
         text = re.sub(
-            r"^(?:hey\s+jarvis|jarvis|hey\s+vayu|vayu)[,\s]*", "", text
+            r"^(?:hey\s+jarvis|jarvis|hey\s+vayu|vayu|hey\s+friday|friday)[,\s]*", "", text
         )
         text = re.sub(r"\b(?:please|also)\b", "", text)
         text = re.sub(r"[.?!]+$", "", text)

@@ -1,3 +1,6 @@
 {
-  "models": {}
+  "models": {
+    "/Users/arnavkshirsagar/vayu-agent/models/hey_friday.onnx": "85ca3e8edbb9e95dacf2005aa107a554488ec1bc88367e323bcb204c5bc7d0ff",
+    "/Users/arnavkshirsagar/vayu-agent/models/hey_friday.onnx.data": "84656d0ec2c9589b9bac7b32ca1249101da5f2d4a19c86acb8603da56be2379b"
+  }
 }

@@ -10,6 +10,7 @@ from core.executor import (
     SecurityViolationError,
 )
 from core.local_parser import DeterministicLocalParser
+from core.voice import JarvisVoice
 from ui.hud_overlay import AssistantState, HUDController
 
 CLOUD_FREE_TIER_DISCLOSURE = (
@@ -38,11 +39,11 @@ def _run_ui_on_main_thread(fn: Callable[[], None]) -> None:
 class VayuController:
     """
     Core UI & orchestration controller bridging Menu Bar, Floating HUD,
-    Hardware Stream Teardown Kill-Switch, and Sandboxed Executor.
+    Jarvis Voice Synthesizer, Hardware Stream Teardown Kill-Switch, and Sandboxed Executor.
     """
 
     WAKE_PREFIX_RE = re.compile(
-        r"^(?:hey\s+(?:vayu|jarvis)|vayu|jarvis)[,\s]*", flags=re.IGNORECASE
+        r"^(?:hey\s+(?:friday|jarvis|vayu)|friday|jarvis|vayu)[,\s]*", flags=re.IGNORECASE
     )
 
     def __init__(
@@ -53,15 +54,18 @@ class VayuController:
         hud: HUDController | None = None,
         fallback_router: Callable[[str], str] | None = None,
         on_state_change: Callable[[AssistantState, bool], None] | None = None,
+        voice: JarvisVoice | None = None,
     ) -> None:
         self.executor = executor
         self.parser = parser
         self.audio_engine = audio_engine
         self.fallback_router = fallback_router
         self.on_state_change = on_state_change
+        self.voice = voice or JarvisVoice(enabled=False)
 
         self.cloud_mode_enabled: bool = False  # Strictly opt-in; defaults to 100% offline
         self.state: AssistantState = AssistantState.HARD_OFF
+        self._spoke_this_turn: bool = False
 
         self.hud = hud or HUDController(on_kill_mic=self.engage_hard_off)
         self.audio_engine.on_wake_confirm = self._handle_wake_detected
@@ -79,14 +83,16 @@ class VayuController:
         self.hud.show_status(
             state=AssistantState.ACTIVE,
             headline="🟢 Vayu: Active",
-            detail='Listening locally for wake word',
+            detail="Listening locally for wake word",
             auto_hide_seconds=2.0,
         )
+        self.voice.speak("Vayu online and listening.")
 
     def engage_hard_off(self) -> None:
         """Hard Kill-Switch: tears down sounddevice stream and wipes RAM buffer."""
         self.audio_engine.disable_mic()
         self._set_state(AssistantState.HARD_OFF)
+        self.voice.speak("Microphone disconnected.")
 
     def toggle_mic(self) -> None:
         if self.audio_engine.is_mic_enabled:
@@ -116,9 +122,11 @@ class VayuController:
         return self.cloud_mode_enabled
 
     def _handle_wake_detected(self, wake_label: str, score: float) -> bool:
-        """Secondary wake-word gate: ignores triggers if muted and pops up HUD with KILL MIC."""
+        """Secondary wake-word gate: interrupts speech, ignores muted state, and shows HUD."""
         if not self.audio_engine.is_mic_enabled:
             return False
+        if self.voice.is_speaking:
+            self.voice.stop()
         self._set_state(AssistantState.LISTENING)
         self.hud.show_status(
             state=AssistantState.LISTENING,
@@ -130,6 +138,7 @@ class VayuController:
 
     def process_transcript(self, raw_transcript: str) -> str:
         """Routes transcribed text through Tier 1 parser, confirmation gate, and sandboxed executor."""
+        self._spoke_this_turn = False
         cleaned_transcript = self.WAKE_PREFIX_RE.sub(
             "", (raw_transcript or "").strip()
         ).strip()
@@ -169,6 +178,14 @@ class VayuController:
             return msg
 
     def _execute_with_confirmation(self, tool_name: str, args: dict) -> str:
+        # Route spoken LLM replies through JarvisVoice so speech cancels cleanly on wake triggers
+        if tool_name == "reply" and args.get("speak", True):
+            text = self.executor.dispatch("reply", {**args, "speak": False})
+            if text:
+                self.voice.speak(text)
+                self._spoke_this_turn = True
+            return text
+
         try:
             return self.executor.dispatch(tool_name, args)
         except ConfirmationRequiredError as confirm_err:
@@ -196,6 +213,11 @@ class VayuController:
             detail=summary,
             auto_hide_seconds=2.5,
         )
+        if not self._spoke_this_turn:
+            spoken = self.voice.format_outcome(summary)
+            if spoken:
+                self.voice.speak(spoken)
+        self._spoke_this_turn = False
 
 
 def run_menubar_app() -> None:
@@ -241,6 +263,7 @@ def run_menubar_app() -> None:
                 parser=parser,
                 audio_engine=audio,
                 on_state_change=self._sync_menu_ui,
+                voice=JarvisVoice(enabled=True),
             )
 
         def _sync_menu_ui(self, state: AssistantState, cloud_enabled: bool) -> None:
